@@ -1,13 +1,35 @@
 #!/bin/bash
 
-## Fork of MarkR’s GlusterFS-checks at:
+## Fork of MarkR's GlusterFS-checks at:
 ## http://exchange.nagios.org/directory/Plugins/System-Metrics/File-System/GlusterFS-checks/details
 
 ### CHANGELOG
+## 1.0.4
+# * 19/03/2020
+# * Modified by Edgar Matzinger <edgar@edgar-matzinger.nl>
+#
+# - outputs performance data (v;w;c;min;max) on free space and bricks (v)
+# - introduced long options
+# - allow for (almost) any unit to process free space, warning and
+#   critical thresholds
+# - all calculations w.r.t. free space are done in kilobytes (KB)
+#   critical and warning thresholds are first converted into KB
+#   and converted back into the desired unit for output
+# - warning and critical thresholds can be specified in percentages
+#   irrespective of the desired unit
+# - if the desired output unit is in percentages, warning and critical
+#   thresholds MUST be in percentages too
+# - if utils.sh isn't located, make up some exit values
+# - according to Nagios Plugin Dev Guideline, --timeout should be present,
+#   but this script doesn't use it nor is verbosity used
+# - verify if a correct output unit is specified
+# - enclosed variables in braces (${var})
+# - nice to have: getting rid of awk (integer math maybe?)
+
 ## 1.0.2
 # * 07/01/2014
 # * Modified by Doug Wilson <dwilson@customink.com>
-# * includes carrillm’s fix to support TB sized volumes
+# * includes carrillm's fix to support TB sized volumes
 # * outputs all errors on a critical alarm, not just free space
 
 # This Nagios script was written against version 3.3 & 3.4 of Gluster.  Older
@@ -30,55 +52,240 @@
 
 PATH=/sbin:/bin:/usr/sbin:/usr/bin
 
-PROGNAME=$(basename -- $0)
-PROGPATH=`echo $0 | sed -e 's,[\\/][^\\/][^\\/]*$,,'`
-REVISION="1.0.1"
+PROGNAME=${0##*/}	# strip everything including the last '/', i.e. act as basename
+PROGPATH=${0%/*}	# strip everything after and including the last '/', i.e. act as dirname
 
-. $PROGPATH/utils.sh
+REVISION="1.0.4"
 
-# parse command line
-usage () {
-	echo ""
-	echo "USAGE: "
-	echo "  $PROGNAME -v VOLUME -n BRICKS [-w GB -c GB]"
-	echo "     -n BRICKS: number of bricks"
-	echo "     -w and -c values in GB"
-	exit $STATE_UNKNOWN
-}
-
-while getopts "v:n:w:c:" opt; do
-	case $opt in
-	v) VOLUME=${OPTARG} ;;
-	n) BRICKS=${OPTARG} ;;
-	w) WARN=${OPTARG} ;;
-	c) CRIT=${OPTARG} ;;
-	*) usage ;;
-	esac
-done
-
-if [ -z "${VOLUME}" -o -z "${BRICKS}" ]; then
-	usage
+if [[ -f ${PROGPATH}/utils.sh ]]; then
+	# located it, source utils.sh
+	. ${PROGPATH}/utils.sh
+else
+	# utils.sh not located, make some exit values up
+	STATE_OK=0
+	STATE_WARNING=1
+	STATE_CRITICAL=2
+	STATE_UNKNOWN=3
+	STATE_DEPENDENT=4
 fi
 
-Exit () {
+function Exit () {
 	echo "$1: ${2:0}"
 	status=STATE_$1
 	exit ${!status}
 }
 
+function convertToKB
+{
+	local unit="${1:0:1}"
+	local val="${2:-0}"
+	local totalKB="${3:-0}"
+
+	awk 'BEGIN{
+		unit = "'${unit}'";
+		val = '${val}';
+		totalspace = '${totalKB}';
+
+		switch (tolower(unit)) {
+			case "%" :
+				printf ("%d\n", (val * totalspace / 100));
+				break;
+			case "b" :
+				printf ("%d\n", val / 1024);
+				break;
+			case "m" :
+				printf ("%d\n", val * 1024);
+				break;
+			case "g" :
+				printf ("%d\n", val * (1024 * 1024));
+				break;
+			case "t" :
+				printf ("%d\n", val * (1024 * 1024 * 1024));
+				break;
+			case "p" :
+				printf ("%d\n", val * (1024 * 1024 * 1024 * 1024));
+				break;
+			default:
+				printf ("%d\n", val);
+				break;
+		}
+	}'
+}
+
+function convertToUnit
+{
+	local unit="${1:0:1}"
+	local val="${2:-0}"
+	local totalKB="${3:-0}"
+
+	awk 'BEGIN{
+		unit = "'${unit}'";
+		val = '${val}';
+		totalspace = '${totalKB}';
+
+		switch (tolower(unit)) {
+			case "%" :
+				printf ("%1.1f\n", 100 * val / totalspace);
+				break;
+			case "b" :
+				printf ("%d\n", val * 1024);
+				break;
+			case "m" :
+				printf ("%1.3f\n", val / 1024);
+				break;
+			case "g" :
+				printf ("%1.3f\n", val / (1024 * 1024));
+				break;
+			case "t" :
+				printf ("%1.3f\n", val / (1024 * 1024 * 1024));
+				break;
+			case "p" :
+				printf ("%1.3f\n", val / (1024 * 1024 * 1024 * 1024));
+				break;
+			default:
+				printf ("%d\n", val);
+				break;
+		}
+	}'
+}
+
+function usage () {
+	local action="${1}"
+	local msg="${2}"
+
+	# if on a terminal and a message has been specified, print it.
+	[[ -t 1 && -n "${msg}" ]] && echo -e "${PROGNAME}: ${msg}" 1>&2
+
+	# if on a terminal and an action is specified (either USAGE or HELP)
+	if [[ -t 1 && -n "${action}" ]]; then
+	(
+		# print brief usage
+		echo -e "${PROGNAME}: usage: ${PROGNAME} -v <VOLUME> -n <BRICKS> [-u <{%|B|K|M|G|T|P}>] [-w <THRESHOLD[%]> -c <THRESHOLD[%]>]"
+		if [[ ${action} == "HELP" ]]; then
+			# print extensive help
+			echo -e "where options are:\n"
+			echo -e "\t--version\t\t\t- show version and exit"
+			echo -e "\t-U,--usage\t\t\t- show brief information"
+			echo -e "\t-c,--critical <THRESHOLD>\t- return critical if free disk space is below threshold"
+			echo -e "\t-h,--help\t\t\t- show this information"
+			echo -e "\t-n,--bricks <BRICKS>\t\t- number of bricks to be expected to be used on volume"
+			echo -e "\t-u,--unit <{%|B|K|M|G|T|P}>\t- output unit, default G"
+			echo -e "\t-v,--volume <VOLUME>\t\t- volume to inspect"
+			echo -e "\t-w,--warning <THRESHOLD>\t- return warning if free disk space is below threshold"
+			echo -e "\noptions can be specified in any order"
+		fi
+	) 1>&2
+	fi
+
+	# if not on a terminal, print a message to nagios/naemon/etc.
+	[[ ! -t 1 && -n "${msg}" ]] && Exit UNKNOWN "incorrect program usage: ${msg}"
+
+	# default exit code
+	exit ${STATE_UNKNOWN}
+}
+
+# main
+
+# force UNIT to be in uppercase
+typeset -u UNIT='G'
+
+# parse command line
+while getopts ":Uc:hn:u:v:w:-:" opt; do
+	case ${opt} in
+		-)
+			case "${OPTARG}" in
+				bricks)
+					BRICKS="${!OPTIND}"
+					OPTIND=$(( ${OPTIND} + 1 ))
+					[[ -z "${BRICKS}" ]] && usage "USAGE" "option --${OPTARG%%=*} needs an argument"
+					;;
+				bricks=*)
+					BRICKS=${OPTARG#*=}
+					[[ -z "${BRICKS}" ]] && usage "USAGE" "option --${OPTARG%%=*} needs an argument"
+					;;
+				critical)
+					CRIT="${!OPTIND}"
+					OPTIND=$(( ${OPTIND} + 1 ))
+					[[ -z "${CRIT}" ]] && usage "USAGE" "option --${OPTARG%%=*} needs an argument"
+					;;
+				critical=*)
+					CRIT=${OPTARG#*=}
+					[[ -z "${CRIT}" ]] && usage "USAGE" "option --${OPTARG%%=*} needs an argument"
+					;;
+				help)
+					usage "HELP" ""
+					;;
+				unit)
+					UNIT="${!OPTIND}"
+					OPTIND=$(( ${OPTIND} + 1 ))
+					[[ -z "${UNIT}" ]] && usage "USAGE" "option --${OPTARG%%=*} needs an argument"
+					;;
+				unit=*)
+					UNIT="${OPTARG#*=}"
+					[[ -z "${UNIT}" ]] && usage "USAGE" "option --${OPTARG%%=*} needs an argument"
+					;;
+				usage)
+					usage "USAGE" ""
+					;;
+				version)
+					usage "" "version: ${REVISION}"
+					;;
+				volume)
+					VOLUME="${!OPTIND}"
+					OPTIND=$(( ${OPTIND} + 1 ))
+					[[ -z "${VOLUME}" ]] && usage "USAGE" "option --${OPTARG%%=*} needs an argument"
+					;;
+				volume=*)
+					VOLUME=${OPTARG#*=}
+					[[ -z "${VOLUME}" ]] && usage "USAGE" "option --${OPTARG%%=*} needs an argument"
+					;;
+				warning)
+					WARN="${!OPTIND}"
+					OPTIND=$(( ${OPTIND} + 1 ))
+					[[ -z "${WARN}" ]] && usage "USAGE" "option --${OPTARG%%=*} needs an argument"
+					;;
+				warning=*)
+					WARN=${OPTARG#*=}
+					[[ -z "${WARN}" ]] && usage "USAGE" "option --${OPTARG%%=*} needs an argument"
+					;;
+				*)
+					if [ "${OPTERR}" = 1 ] && [ "${optspec:0:1}" != ":" ]; then
+						usage "USAGE" "Unknown option --${OPTARG}"
+					fi
+					;;
+			esac ;;
+		U) usage "USAGE" ;;
+		c) CRIT=${OPTARG} ;;
+		h) usage "HELP" ;;
+		n) BRICKS=${OPTARG} ;;
+		u) UNIT="${OPTARG:0:1}" ;;
+		v) VOLUME=${OPTARG} ;;
+		w) WARN=${OPTARG} ;;
+		:) usage "USAGE" "option -${OPTARG} needs an argument" ;;
+		*) usage "USAGE" "unknown option -${OPTARG}";;
+	esac
+done
+
+[[ -z "${VOLUME}" || -z "${BRICKS}" ]] &&  usage "USAGE" "please specify both a volume and the number of expected bricks"
+
+[[ -n "${CRIT}" && -z "${WARN}" ]] && usage "USAGE" "please specify a warning threshold too"
+[[ -z "${CRIT}" && -n "${WARN}" ]] && usage "USAGE" "please specify a critical threshold too"
+
+[[ ! "BKMGTP%" =~ "${UNIT}" ]] && usage "USAGE" "invalid output unit: ${UNIT}"
+
 # check for commands
-for cmd in basename bc awk sudo pidof gluster; do
-	if ! type -p "$cmd" >/dev/null; then
-		Exit UNKNOWN "$cmd not found"
+for cmd in awk gluster pidof sudo; do
+	if ! type -p "${cmd}" >/dev/null; then
+		Exit UNKNOWN "${cmd} not found"
 	fi
 done
 
-# check for glusterd (management daemon)
+# check for running glusterd (management daemon)
 if ! pidof glusterd &>/dev/null; then
 	Exit CRITICAL "glusterd management daemon not running"
 fi
 
-# check for glusterfsd (brick daemon)
+# check for running glusterfsd (brick daemon)
 if ! pidof glusterfsd &>/dev/null; then
 	Exit CRITICAL "glusterfsd brick daemon not running"
 fi
@@ -86,20 +293,21 @@ fi
 # get volume heal status
 heal=0
 for entries in $(sudo gluster volume heal ${VOLUME} info | awk '/^Number of entries: /{print $4}'); do
-	if [ "$entries" -gt 0 ]; then
+	if [ "${entries}" -gt 0 ]; then
 		let $((heal+=entries))
 	fi
 done
-if [ "$heal" -gt 0 ]; then
-	errors=("${errors[@]}" "$heal unsynched entries")
+if [ "${heal}" -gt 0 ]; then
+	errors=("${errors[@]}" "${heal} unsynched entries")
 fi
 
 # get volume status
 bricksfound=0
-freegb=9999999
+freeKB=99999999999
+totalKB=99999999999
 shopt -s nullglob
 while read -r line; do
-	field=($(echo $line))
+	field=($(echo ${line}))
 	case ${field[0]} in
 	Brick) 
 		brick=${field[@]:2}
@@ -109,18 +317,34 @@ while read -r line; do
 		if [ "${key}" = "Disk Space Free" ]; then
 			freeunit=${field[@]:4}
 			free=${freeunit:0:-2}
-			freeconvgb=`echo "($free*1024)" | bc`
-			unit=${freeunit#$free}
-			if [ "$unit" = "TB" ]; then
-				free=$freeconvgb
-				unit="GB"
+			unit=${freeunit#${free}}
+			free=${free%%.*}
+			case "${unit}" in
+				M*)	let $((free *= 1024)) ;;
+				G*)	let $((free *= (1024 *1024))) ;;
+				T*)	let $((free *= (1024 * 1024 *1024))) ;;
+				P*)	let $((free *= (1024 * 1024 * 1024 *1024))) ;;
+			esac
+			if [ ${free} -lt ${freeKB} ]; then
+				freeKB=${free}
 			fi
-			if [ "$unit" != "GB" ]; then
-				Exit UNKNOWN "unknown disk space size $freeunit"
-			fi
-			free=$(echo "${free} / 1" | bc -q)
-			if [ $free -lt $freegb ]; then
-				freegb=$free
+		fi
+		;;
+	Total)
+		key=${field[@]:0:3}
+		if [ "${key}" = "Total Disk Space" ]; then
+			totalunit=${field[@]:4}
+			total=${totalunit:0:-2}
+			unit=${totalunit#${total}}
+			total=${total%%.*}
+			case "${unit}" in
+				M*)	let $((total *= 1024)) ;;
+				G*)	let $((total *= (1024 *1024))) ;;
+				T*)	let $((total *= (1024 * 1024 *1024))) ;;
+				P*)	let $((total *= (1024 * 1024 * 1024 *1024))) ;;
+			esac
+			if [ ${total} -lt ${totalKB} ]; then
+				totalKB=${total}
 			fi
 		fi
 		;;
@@ -129,42 +353,78 @@ while read -r line; do
 		if [ "${online}" = "Y" ]; then
 			let $((bricksfound++))
 		else
-			errors=("${errors[@]}" "$brick offline")
+			errors=("${errors[@]}" "${brick} offline")
 		fi
 		;;
 	esac
 done < <(sudo gluster volume status ${VOLUME} detail)
 
-if [ $bricksfound -eq 0 ]; then
+# process number of bricks found
+if [ ${bricksfound} -eq 0 ]; then
 	Exit CRITICAL "no bricks found"
-elif [ $bricksfound -lt $BRICKS ]; then
-	errors=("${errors[@]}" "found $bricksfound bricks, expected $BRICKS ")
+elif [ ${bricksfound} -lt ${BRICKS} ]; then
+	errors=("${errors[@]}" "found ${bricksfound} bricks, expected ${BRICKS}")
 	ex_stat="WARNING_stat"
 fi
 
-if [ -n "$CRIT" -a -n "$WARN" ]; then
-	if [ $CRIT -ge $WARN ]; then
-		Exit UNKNOWN "critical threshold below warning"
-	elif [ $freegb -lt $CRIT ]; then
-		errors=("${errors[@]}" "free space ${freegb}GB")
+# convert critical threshold to kilobytes
+if [[ "${CRIT}" == *"%"* ]]; then
+	# critical threshold is in percentages
+	CRITVALUE=$(convertToKB "%" "${CRIT%[%BKMGTP]*}" "${totalKB}")
+else
+	# critical threshold is a regular (floating point) number
+	CRITVALUE=$(convertToKB "${UNIT}" "${CRIT%[%BKMGTP]*}")
+fi
+
+# convert warning threshold to kilobytes
+if [[ "${WARN}" == *"%"* ]]; then
+	# warning threshold is in percentages
+	WARNVALUE=$(convertToKB "%" "${WARN%[%BKMGTP]*}" "${totalKB}")
+else
+	# warning threshold is a regular (floating point) number
+	WARNVALUE=$(convertToKB "${UNIT}" "${WARN%[%BKMGTP]*}")
+fi
+
+# verify that critical threshold is lower than warning threshold
+[[ ${CRITVALUE} -ge ${WARNVALUE} ]] && Exit UNKNOWN "critical threshold above warning (${CRITVALUE} >= ${WARNVALUE})"
+
+# freeKB, totalKB, CRITVALUE and WARNVALUE are in kilobytes
+freespace=$(convertToUnit "${UNIT}" "${freeKB}" "${totalKB}")
+totalspace=$(convertToUnit "${UNIT}" "${totalKB}" "${totalKB}")
+crit=$(convertToUnit "${UNIT}" "${CRITVALUE}" "${totalKB}")
+warn=$(convertToUnit "${UNIT}" "${WARNVALUE}" "${totalKB}")
+
+# default performance data
+perfData=" | bricks:${bricksfound},freespace:${freespace}${UNIT};;;0;${totalspace}"
+
+# process critical and warning thresholds
+if [ -n "${CRIT}" -a -n "${WARN}" ]; then
+	# expand performance data with warning and critical thresholds
+	perfData=" | bricks:${bricksfound},freespace:${freespace}${UNIT};${warn};${crit};0;${totalspace}"
+
+	if [ ${freeKB} -lt ${CRITVALUE} ]; then
+		errors=("${errors[@]}" "free space below critical threshold: ${freespace}${UNIT}")
 	        ex_stat="CRITICAL_stat"
-	elif [ $freegb -lt $WARN ]; then
-		errors=("${errors[@]}" "free space ${freegb}GB")
+	elif [ ${freeKB} -lt ${WARNVALUE} ]; then
+		errors=("${errors[@]}" "free space below warning threshold: ${freespace}${UNIT}")
 		ex_stat="WARNING_stat"
 	fi
 fi
 
-# exit with warning if errors
-if [ -n "$errors" ]; then
+# exit with warnings or errors
+if [ -n "${errors}" ]; then
 	sep='; '
 	msg=$(printf "${sep}%s" "${errors[@]}")
 	msg=${msg:${#sep}}
+
+	flt="fault"
+	[[ ${#errors[@]} -gt 1 ]] && flt="${flt}s"
 	if [ ${ex_stat} == "CRITICAL_stat" ]; then
-		Exit CRITICAL "${msg}"
+		Exit CRITICAL "${#errors[@]} ${flt}: ${msg}${perfData}"
 	else
-		Exit WARNING "${msg}"
+		Exit WARNING "${#errors[@]} ${flt}: ${msg}${perfData}"
 	fi
 fi
 
 # exit with no errors
-Exit OK "${bricksfound} bricks; free space ${freegb}GB"
+Exit OK "volume: ${VOLUME}, bricks: ${bricksfound}, free space: ${freespace}${UNIT}${perfData}"
